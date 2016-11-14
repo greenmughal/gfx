@@ -18,11 +18,188 @@
 //! includes several items to facilitate this. 
 
 use std::error::Error;
-use std::{mem, fmt};
-use {buffer, handle, format, mapping, pso, shade, target, texture};
-use {Capabilities, Resources, VertexShader, GeometryShader, PixelShader, ShaderSet};
-use memory::{self, Usage, Typed, Pod, cast_slice};
-use memory::{Bind, RENDER_TARGET, DEPTH_STENCIL, SHADER_RESOURCE, UNORDERED_ACCESS};
+use std::fmt;
+use std::mem;
+use {handle, format, mapping, pso, shade, target, tex};
+use {Capabilities, Resources, Pod};
+use {VertexShader, HullShader, DomainShader, GeometryShader, PixelShader, ShaderSet};
+
+
+/// A service trait used to get the raw data out of
+/// strong types. Not meant for public use.
+pub trait Typed: Sized {
+    /// The raw type behind the phantom.
+    type Raw;
+    /// Crete a new phantom from the raw type.
+    fn new(raw: Self::Raw) -> Self;
+    /// Get an internal reference to the raw type.
+    fn raw(&self) -> &Self::Raw;
+}
+
+
+/// Cast a slice from one POD type to another.
+pub fn cast_slice<A: Pod, B: Pod>(slice: &[A]) -> &[B] {
+    use std::slice;
+    let raw_len = mem::size_of::<A>().wrapping_mul(slice.len());
+    let len = raw_len / mem::size_of::<B>();
+    assert_eq!(raw_len, mem::size_of::<B>().wrapping_mul(len));
+    unsafe {
+        slice::from_raw_parts(slice.as_ptr() as *const B, len)
+    }
+}
+
+/// Specifies the access allowed to a buffer mapping.
+#[derive(Eq, Ord, PartialEq, PartialOrd, Hash, Copy, Clone, Debug)]
+#[repr(u8)]
+pub enum MapAccess {
+    /// Only allow reads.
+    Readable,
+    /// Only allow writes.
+    Writable,
+    /// Allow full access.
+    RW
+}
+
+bitflags!(
+    /// Bind flags
+    pub flags Bind: u8 {
+        /// The resource can be rendered into.
+        const RENDER_TARGET    = 0x1,
+        /// The resource can serve as a depth/stencil target.
+        const DEPTH_STENCIL    = 0x2,
+        /// The resource can be bound to the shader for reading.
+        const SHADER_RESOURCE  = 0x4,
+        /// The resource can be bound to the shader for writing.
+        const UNORDERED_ACCESS = 0x8,
+    }
+);
+
+
+/// Role of the memory buffer. GLES doesn't allow chaning bind points for buffers.
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+#[repr(u8)]
+pub enum BufferRole {
+    /// Generic vertex buffer
+    Vertex,
+    /// Index buffer
+    Index,
+    /// Uniform block buffer //TODO: rename to `Constant`
+    Uniform,
+}
+
+/// A hint as to how this buffer/texture will be used.
+///
+/// The nature of these hints make them very implementation specific. Different drivers on
+/// different hardware will handle them differently. Only careful profiling will tell which is the
+/// best to use for a specific buffer.
+#[derive(Eq, Ord, PartialEq, PartialOrd, Hash, Copy, Clone, Debug)]
+#[repr(u8)]
+pub enum Usage {
+    /// GPU: read + write, CPU: copy. Optimal for render targets.
+    GpuOnly,
+    /// GPU: read, CPU: none. Optimal for resourced textures/buffers.
+    Const,
+    /// GPU: read, CPU: write.
+    Dynamic,
+    /// GPU: copy, CPU: as specified. Used as a staging buffer,
+    /// to be copied back and forth with on-GPU targets.
+    CpuOnly(MapAccess),
+}
+
+/// An information block that is immutable and associated with each buffer.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct BufferInfo {
+    /// Role
+    pub role: BufferRole,
+    /// Usage hint
+    pub usage: Usage,
+    /// Bind flags
+    pub bind: Bind,
+    /// Size in bytes
+    pub size: usize,
+    /// Stride of a single element, in bytes. Only used for structured buffers
+    /// that you use via shader resource / unordered access views.
+    pub stride: usize,
+}
+
+/// Error creating a buffer.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum BufferError {
+    /// Some of the bind flags are not supported.
+    UnsupportedBind(Bind),
+    /// Unknown other error.
+    Other,
+    //todo: unsupported role
+}
+
+impl fmt::Display for BufferError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        if let BufferError::UnsupportedBind(ref bind) = *self {
+            write!(f, "{}: {:?}", self.description(), bind)
+        } else {
+            write!(f, "{}", self.description())
+        }
+    }
+}
+
+impl Error for BufferError {
+    fn description(&self) -> &str {
+        match *self {
+            BufferError::UnsupportedBind(_) => "Bind flags are not supported",
+            BufferError::Other => "An unknown error occurred",
+        }
+    }
+}
+
+/// An error happening on buffer updates.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum BufferUpdateError {
+    /// Trying to change the contents outside of the allocation.
+    OutOfBounds,
+}
+
+impl fmt::Display for BufferUpdateError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.description())
+    }
+}
+
+impl Error for BufferUpdateError {
+    fn description(&self) -> &str {
+        match *self {
+            BufferUpdateError::OutOfBounds =>
+                "Tried to change the buffer contents outside of the allocation",
+        }
+    }
+}
+
+/// An error associated with selected texture layer.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum LayerError {
+    /// The source texture kind doesn't support array slices.
+    NotExpected(tex::Kind),
+    /// Selected layer is outside of the provided range.
+    OutOfBounds(target::Layer, target::Layer),
+}
+
+impl fmt::Display for LayerError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            LayerError::NotExpected(kind) => write!(f, "{}: {:?}", self.description(), kind),
+            LayerError::OutOfBounds(layer, count) => write!(f, "{}: {}/{}", self.description(), layer, count),
+        }
+    }
+}
+
+impl Error for LayerError {
+    fn description(&self) -> &str {
+        match *self {
+            LayerError::NotExpected(_) => "The source texture kind doesn't support array slices",
+            LayerError::OutOfBounds(_, _) => "Selected layer is outside of the provided range",
+        }
+    }
+}
+>>>>>>> refs/heads/dx11_tessellated
 
 /// Error creating either a ShaderResourceView, or UnorderedAccessView.
 #[derive(Clone, PartialEq, Debug)]
@@ -236,6 +413,14 @@ pub trait Factory<R: Resources> {
     /// Compiles a `VertexShader` from source.
     fn create_shader_vertex(&mut self, code: &[u8]) -> Result<VertexShader<R>, shade::CreateShaderError> {
         self.create_shader(shade::Stage::Vertex, code).map(|s| VertexShader(s))
+    }
+    /// Compiles a `HullShader` from source.
+    fn create_shader_hull(&mut self, code: &[u8]) -> Result<HullShader<R>, shade::CreateShaderError> {
+        self.create_shader(shade::Stage::Hull, code).map(|s| HullShader(s))
+    }
+    /// Compiles a `VertexShader` from source.
+    fn create_shader_domain(&mut self, code: &[u8]) -> Result<DomainShader<R>, shade::CreateShaderError> {
+        self.create_shader(shade::Stage::Domain, code).map(|s| DomainShader(s))
     }
     /// Compiles a `GeometryShader` from source.
     fn create_shader_geometry(&mut self, code: &[u8]) -> Result<GeometryShader<R>, shade::CreateShaderError> {
